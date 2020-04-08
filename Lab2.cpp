@@ -146,6 +146,11 @@ int main(int argc, char* argv[])
         for (int i = 0; i < size; i++)
             lengths[i] = length;
         lengths[size - 1] += m - size_m;        // real size of the last block
+        if (size > m)
+        {
+            for (int i = m; i < size; i++)
+                lengths[i] = 0;
+        }
 
 
         MPI_Scatter(a, length * m, MPI_LONG_DOUBLE, temp_a, length * m, MPI_LONG_DOUBLE, 0, MPI_COMM_WORLD);
