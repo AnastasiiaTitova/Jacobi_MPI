@@ -2,11 +2,10 @@
 #include <fstream>
 #include <string>
 #include "mpi.h"
-#include <algorithm>
 
 using namespace std;
 
-void generate(int size)
+void generate(const int size)
 {
     int** mat = new int* [size];
     for (auto i = 0; i < size; i++)
@@ -51,8 +50,162 @@ void generate(int size)
     return;
 }
 
+void readFiles(const int size, long double* a, long double* b, long double *x)
+{
+    string name = "matrix" + to_string(size) + ".txt";
+    cout << "Reading file " << name << endl;
+    ifstream in;
+
+    in.open(name);
+    if (!in.is_open())
+        throw "Can't open file " + name;
+
+    int m, n;
+    in >> m >> n;
+    if (n != m + 1 || size != m)
+    {
+        in.close();
+        throw "Incorrect matrix parameters! n = " + to_string(n) + " m = " + to_string(m);
+    }
+
+    for (auto i = 0; i < m; i++)
+    {
+        for (auto j = 0; j < m; j++)
+            in >> a[i * m + j];
+        in >> b[i];
+    }
+    in.close();
+
+    name = "approx" + to_string(m) + ".txt";
+    cout << "Reading file " << name << endl;
+    int m1;
+
+    in.open(name);
+    if (!in.is_open())
+        throw "Can't open file " + name;
+
+    in >> m1;
+    if (m1 != m)
+    {
+        in.close();
+        throw "Incorrect length of X vector! Global m = " + to_string(m) + " Local m = " + to_string(m1);
+    }
+    for (auto i = 0; i < m; i++)
+        in >> x[i];
+
+    in.close();
+}
+
+bool isSolvable(const int m, const long double* a)
+{
+    cout << "Checking matrix " << endl;
+    for (auto i = 0; i < m; i++)
+    {
+        double sum = 0;
+        for (auto j = 0; j < m; j++)
+            if (i != j)
+                sum += a[i * m + j];
+        if (a[i * m + i] <= sum || a[i * m + i] == 0)
+        {
+            cout << "Can't work with this matrix! Row " + to_string(i + 1) + " is bad";
+            return false;
+        }
+    }
+    cout << "Matrix is ok" << endl;
+    return true;
+}
+
+void printResult(const int m, const long double* x)
+{
+    ofstream out;
+    out.open("result.txt");
+
+    out << m << endl;
+    for (auto i = 0; i < m; i++)
+        out << x[i] << endl;
+    out.close();
+}
+
+void calculateLengthsAndOffsets(const int size, const int m, int * lengths, int* lengths_a, int *offsets, int* offsets_a)
+{
+    for (auto i = 0; i < size; i++)
+        lengths[i] = m / size;
+    for (auto i = 0; i < m - (m / size) * size; i++)
+        lengths[i]++;
+    if (size > m)
+    {
+        for (int i = m; i < size; i++)
+            lengths[i] = 0;
+    }
+    for (auto i = 0; i < size; i++)
+        lengths_a[i] = lengths[i] * m;
+
+    offsets[0] = 0;
+    offsets_a[0] = 0;
+    for (auto i = 1; i < size; i++)
+    {
+        offsets[i] = offsets[i - 1] + lengths[i - 1];
+        offsets_a[i] = offsets_a[i - 1] + lengths_a[i - 1];
+    }
+}
+
+double findLocalMaxNorm(const int length, const int offset, const long double* x, const long double* temp_x)
+{
+    double norm = 0;
+    for (auto i = 0; i < length; i++)
+    {
+        if (abs(x[offset + i] - temp_x[i]) > norm)
+            norm = abs(x[offset + i] - temp_x[i]);
+    }
+    return norm;
+}
+
+double findGlobalMaxNorm(const int size, const long double* norms)
+{
+    double norm = norms[0];
+    for (int i = 0; i < size; i++)
+    {
+        if (norms[i] > norm)
+            norm = norms[i];
+    }
+    return norm;
+}
+
+void Jacobi(const int m, const int size, const int rank, const double eps,
+    const int* offsets, const int* lengths,
+    long double * temp_x, long double* temp_a, long double* temp_b, 
+    long double* norms, long double* x)
+{
+    long double norm = 1;
+    auto offset = offsets[rank];
+    auto length = lengths[rank];
+
+    while (norm > eps)
+    {
+        for (auto i = 0; i < length; i++)
+        {
+            temp_x[i] = temp_b[i];
+
+            for (auto j = 0; j < m; j++)
+            {
+                if (i + offset != j)
+                    temp_x[i] -= temp_a[i * m + j] * x[j];
+            }
+            temp_x[i] /= temp_a[i * m + i + offset];
+        }
+
+        norm = findLocalMaxNorm(length, offset, x, temp_x);
+        
+        MPI_Allgather(&norm, 1, MPI_LONG_DOUBLE, norms, 1, MPI_LONG_DOUBLE, MPI_COMM_WORLD);
+        MPI_Allgatherv(temp_x, length, MPI_LONG_DOUBLE, x, lengths, offsets, MPI_LONG_DOUBLE, MPI_COMM_WORLD);
+        
+        norm = findGlobalMaxNorm(size, norms);
+    }
+}
+
 int main(int argc, char* argv[])
 {
+    long double* a = {}, * b = {}, * x = {};
     try
     {
         MPI_Init(&argc, &argv);
@@ -62,151 +215,47 @@ int main(int argc, char* argv[])
         MPI_Comm_rank(MPI_COMM_WORLD, &rank);
 
         int m = 300;            // <---- put here matrix size 
-        int n;
+        const double eps = 0.001;
 
-        int size_m = size;
-        if (m % size == 0) 
-            size_m = m;
-        else if (m > size) 
-            size_m = m + size - (m % size);
-        
-        double eps = 0.001;
-        long double* a, * b, * x;
-
-        a = new long double [m * size_m];
-        b = new long double [size_m];
-        x = new long double [size_m];
+        a = new long double[m * m]; 
+        b = new long double[m]; 
+        x = new long double[m];
 
         if (rank == 0)
         {
             //generate(m);
-
-            string name = "matrix" + to_string(m) + ".txt";
-            cout << "Reading file " << name << endl;
-            ifstream in;
-
-            in.open(name);
-            if (!in.is_open())
-                throw "Can't open file " + name;
-
-            in >> m >> n;
-            if (n != m + 1)
-            {
-                in.close();
-                throw "Incorrect matrix parameters! n = " + to_string(n) + " m = " + to_string(m);
-            }
-
-            for (auto i = 0; i < m; i++)
-            {
-                for (auto j = 0; j < m; j++)
-                    in >> a[i * m + j];
-                in >> b[i];
-            }
-            in.close();
-
-            name = "approx" + to_string(m) + ".txt";
-            cout << "Reading file " << name << endl;
-            int m1;
-
-            in.open(name);
-            if (!in.is_open())
-                throw "Can't open file " + name;
-
-            in >> m1;
-            if (m1 != m)
-            {
-                in.close();
-                throw "Incorrect length of X vector! Global m = " + to_string(m) + " Local m = " + to_string(m1);
-            }
-            for (auto i = 0; i < m; i++)
-                in >> x[i];
-            in.close();
-
-
-            cout << "Checking matrix " << endl;
-            for (auto i = 0; i < m; i++)
-            {
-                double sum = 0;
-                for (auto j = 0; j < m; j++)
-                    if (i != j)
-                        sum += a[i * m + j];
-                if (a[i * m + i] <= sum || a[i * m + i] == 0)
-                    throw "Can't work with this matrix! Row " + to_string(i + 1) + " is bad";
-            }
-            cout << "Matrix is ok" << endl;
+            readFiles(m, a, b, x);  
+            if (!isSolvable(m, a))
+                throw "Can not solve";
         }
-        
-        int length = size_m / size;
-        long double* temp_a = new long double [m * length];
-        long double* temp_b = new long double [length];        
-        long double* temp_x = new long double [length];
-        long double* norms = new long double [size];
 
+        // prepare things for Scatterv
         int* lengths = new int[size];
-        for (int i = 0; i < size; i++)
-            lengths[i] = length;
-        lengths[size - 1] += m - size_m;        // real size of the last block
-        if (size > m)
-        {
-            for (int i = m; i < size; i++)
-                lengths[i] = 0;
-        }
+        int* lengths_a = new int[size];
+        int* offsets = new int[size];
+        int* offsets_a = new int[size];
+        calculateLengthsAndOffsets(size, m, lengths, lengths_a, offsets, offsets_a);
+        auto length_a = lengths_a[rank];
+        auto length = lengths[rank];
+        long double* temp_a = new long double[length_a];
+        long double* temp_b = new long double[length];
+        long double* temp_x = new long double[length];
+        long double* norms = new long double[size];
 
-
-        MPI_Scatter(a, length * m, MPI_LONG_DOUBLE, temp_a, length * m, MPI_LONG_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Scatter(b, length, MPI_LONG_DOUBLE, temp_b, length, MPI_LONG_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Bcast(x, length, MPI_LONG_DOUBLE, 0, MPI_COMM_WORLD);
-        MPI_Bcast(norms, size, MPI_LONG_DOUBLE, 0, MPI_COMM_WORLD);
+        // do Scatterv and Bcast
+        MPI_Scatterv(a, lengths_a, offsets_a, MPI_LONG_DOUBLE, temp_a, length_a, MPI_LONG_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Scatterv(b, lengths, offsets, MPI_LONG_DOUBLE, temp_b, length, MPI_LONG_DOUBLE, 0, MPI_COMM_WORLD);
+        MPI_Bcast(x, m, MPI_LONG_DOUBLE, 0, MPI_COMM_WORLD);
 
         // Jakobi
-        long double norm = 1;
         const auto start = MPI_Wtime();
-        while (norm > eps)
-        {
-            for (auto i = 0; i < lengths[rank]; i++)
-            {
-                temp_x[i] = temp_b[i];
-                for (auto j = 0; j < m; j++)
-                {
-                    if (i + length * rank != j)
-                        temp_x[i] -= temp_a[i * m + j] * x[j];
-                }
-                temp_x[i] /= temp_a[i * m + i + length * rank];
-            }
-
-            // find max norm
-            norm = 0;
-            for (auto i = 0; i < lengths[rank]; i++)
-            {
-                if (abs(x[rank * length + i] - temp_x[i]) > norm)
-                    norm = abs(x[rank * length + i] - temp_x[i]);
-                x[rank * length + i] = temp_x[i];
-            }
-
-            MPI_Allgather(&norm, 1, MPI_LONG_DOUBLE, norms, 1, MPI_LONG_DOUBLE, MPI_COMM_WORLD);
-            //MPI_Reduce(&norm, &res_norm, 1, MPI_LONG_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
-            MPI_Allgather(temp_x, length, MPI_LONG_DOUBLE, x, length, MPI_LONG_DOUBLE, MPI_COMM_WORLD);
-
-            norm = norms[0];
-            for (int i = 0; i < size; i++)
-            {
-                if (norms[i] > norm)
-                    norm = norms[i];
-            }
-        }
+        Jacobi(m, size, rank, eps, offsets, lengths, temp_x, temp_a, temp_b, norms, x);
         const auto finish = MPI_Wtime();
-        delete[] temp_x; 
 
         if (rank == 0)
         {
             cout << "Number of processes: " << size << " Size: " << m << " Time: " << finish - start << endl;
-            ofstream out;
-            out.open("result.txt");
-
-            out << m << endl;
-            for (auto i = 0; i < m; i++)
-                out << x[i] << endl;
-            out.close();
+            printResult(m, x);
         }
 
         delete[] a;
@@ -214,14 +263,21 @@ int main(int argc, char* argv[])
         delete[] b;
         delete[] temp_b;
         delete[] x;
+        delete[] temp_x;
         delete[] norms;
         delete[] lengths;
+        delete[] lengths_a;
+        delete[] offsets;
+        delete[] offsets_a;
 
         MPI_Finalize();
     }
-    catch (exception e)
+    catch (string error)
     {
-        cout << e.what();
+        delete[] a;
+        delete[] b;
+        delete[] x;
+        cout << error;
     }
 
     return 0;
